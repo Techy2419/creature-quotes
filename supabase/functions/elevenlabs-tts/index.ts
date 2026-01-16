@@ -6,6 +6,7 @@ const corsHeaders = {
 };
 
 serve(async (req) => {
+  // Handle CORS preflight requests
   if (req.method === "OPTIONS") {
     return new Response(null, { headers: corsHeaders });
   }
@@ -29,8 +30,24 @@ serve(async (req) => {
       );
     }
 
-    console.log("Generating TTS for text:", text);
-    console.log("Using voice ID:", voiceId || "ssKAEhdevSPzKs37U6qX");
+    // Clean and validate the text before sending to ElevenLabs
+    let cleanText = text.trim().replace(/\s+/g, ' ');
+    
+    // Extra validation - make sure the text doesn't have weird prepending
+    if (cleanText.length === 0) {
+      console.error("Empty text received for TTS");
+      return new Response(
+        JSON.stringify({ error: "Text cannot be empty" }),
+        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+      );
+    }
+    
+    // Log the exact text being sent to ElevenLabs for debugging
+    console.log("TTS Request - Original text:", text);
+    console.log("TTS Request - Cleaned text:", cleanText);
+    console.log("TTS Request - First character:", cleanText[0]);
+    console.log("TTS Request - Text length:", cleanText.length);
+    console.log("TTS Request - Using voice ID:", voiceId || "ssKAEhdevSPzKs37U6qX");
 
     const response = await fetch(
       `https://api.elevenlabs.io/v1/text-to-speech/${voiceId || "ssKAEhdevSPzKs37U6qX"}?output_format=mp3_44100_128`,
@@ -41,7 +58,7 @@ serve(async (req) => {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          text,
+          text: cleanText,
           model_id: "eleven_multilingual_v2",
           voice_settings: {
             stability: 0.5,

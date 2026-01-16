@@ -28,16 +28,17 @@ export const MashupPlayer = ({
   const [explosionWord, setExplosionWord] = useState("");
   const audioManagerRef = useRef<WebAudioManager | null>(null);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
+  const quoteGainNodeRef = useRef<GainNode | null>(null);
 
   const canPlay = selectedAnimal && selectedQuote.trim().length > 0;
 
-  // Initialize Web Audio Manager
+  // Set up the Web Audio Manager when component mounts
   useEffect(() => {
     audioManagerRef.current = getAudioManager();
     audioManagerRef.current.init();
 
     return () => {
-      // Cleanup on unmount
+      // Stop all audio when component unmounts - prevents memory leaks
       if (audioManagerRef.current) {
         audioManagerRef.current.stopAll();
       }
@@ -111,7 +112,7 @@ export const MashupPlayer = ({
   };
 
   /**
-   * Load audio buffer from URL using Web Audio API
+   * Convert the audio URL into an AudioBuffer that Web Audio API can work with
    */
   const loadAudioBuffer = async (url: string): Promise<AudioBuffer | null> => {
     if (!audioManagerRef.current) return null;
@@ -124,7 +125,7 @@ export const MashupPlayer = ({
   };
 
   /**
-   * Play audio buffer with Web Audio API
+   * Play an AudioBuffer with Web Audio API - gives us precise timing control
    */
   const playAudioBuffer = (
     buffer: AudioBuffer,
@@ -134,29 +135,55 @@ export const MashupPlayer = ({
       duration?: number;
       volume?: number;
       onEnded?: () => void;
-    } = {}
+    } = {},
+    isQuote: boolean = false
   ): AudioBufferSourceNode | null => {
     if (!audioManagerRef.current) return null;
-    const source = audioManagerRef.current.playBuffer(buffer, options);
+    const { source, gainNode } = audioManagerRef.current.playBuffer(buffer, options);
     activeSourcesRef.current.push(source);
+    
+    // Store the quote's gain node so we can duck it during word replacements
+    if (isQuote) {
+      quoteGainNodeRef.current = gainNode;
+    }
+    
     return source;
   };
 
   const playMashup = async () => {
     if (!canPlay || !selectedAnimal || !audioManagerRef.current) return;
 
-    // Resume AudioContext if suspended (required after user interaction)
+    // Make sure AudioContext is running - browsers suspend it until user interaction
     await audioManagerRef.current.resume();
 
     setIsLoading(true);
     setIsPlaying(true);
     
-    const quoteWords = selectedQuote.trim().split(/\s+/);
+    // Clean the quote text - remove extra spaces and ensure it's a valid string
+    let cleanQuote = selectedQuote.trim().replace(/\s+/g, ' ');
+    
+    // Defensive check - make sure nothing weird got prepended to the quote
+    // Sometimes empty quotes or edge cases can cause issues
+    if (!cleanQuote || cleanQuote.length === 0) {
+      console.error("Empty quote detected!");
+      setIsPlaying(false);
+      setIsLoading(false);
+      return;
+    }
+    
+    // Log the exact quote being sent to TTS for debugging
+    console.log("Original quote:", selectedQuote);
+    console.log("Cleaned quote being sent to TTS:", cleanQuote);
+    console.log("Quote starts with:", cleanQuote[0]);
+    
+    const quoteWords = cleanQuote.split(/\s+/);
     setWords(quoteWords);
     const replaceIndices = getRandomIndices(quoteWords.length);
     setReplacedIndices(replaceIndices);
     setCurrentWordIndex(-1);
     setShowExplosion(false);
+
+    console.log("Words to replace at indices:", replaceIndices);
 
     let quoteBuffer: AudioBuffer | null = null;
     let animalBuffer: AudioBuffer | null = null;
@@ -164,9 +191,10 @@ export const MashupPlayer = ({
     let animalAudioUrl: string | null = null;
 
     try {
-      // Generate all audio upfront in parallel for speed
+      // Generate both TTS and SFX at the same time to speed things up
+      // Make sure we send the cleaned quote, not the original
       const [quoteUrl, animalUrl] = await Promise.all([
-        generateTTS(selectedQuote),
+        generateTTS(cleanQuote),
         generateAnimalSound(selectedAnimal.sfxPrompt)
       ]);
 
@@ -180,7 +208,13 @@ export const MashupPlayer = ({
         return;
       }
 
-      // Load audio buffers using Web Audio API
+      // Stop any currently playing audio before loading new buffers
+      // This prevents old audio from playing over new audio
+      if (audioManagerRef.current) {
+        audioManagerRef.current.stopAll();
+      }
+
+      // Convert the audio URLs into AudioBuffers so we can schedule them precisely
       const [quoteBuf, animalBuf] = await Promise.all([
         loadAudioBuffer(quoteAudioUrl),
         animalAudioUrl ? loadAudioBuffer(animalAudioUrl) : Promise.resolve(null),
@@ -196,12 +230,18 @@ export const MashupPlayer = ({
         return;
       }
 
+      // Log the audio buffer details for debugging
+      console.log("Quote audio buffer loaded:");
+      console.log("  Duration:", quoteBuffer.duration, "seconds");
+      console.log("  Sample rate:", quoteBuffer.sampleRate);
+      console.log("  Number of channels:", quoteBuffer.numberOfChannels);
+
       setIsLoading(false);
 
       const audioManager = audioManagerRef.current;
       const startTime = audioManager.getCurrentTime();
 
-      // 1. Play initial animal sound (800ms)
+      // Start with a quick animal sound to set the mood
       if (animalBuffer) {
         playAudioBuffer(animalBuffer, {
           startTime,
@@ -210,22 +250,63 @@ export const MashupPlayer = ({
         });
       }
 
-      // 2. Play the full quote starting after initial sound + gap
+      // Play the quote after the intro sound, with a small gap
       const quoteStartTime = startTime + 0.8 + 0.3; // 800ms sound + 300ms gap
       const quoteDuration = quoteBuffer.duration;
 
+      // Play the quote and store its gain node for volume control
       playAudioBuffer(quoteBuffer, {
         startTime: quoteStartTime,
         volume: 1.0,
         onEnded: () => {
-          // Quote finished
+          // Done playing the quote
         },
-      });
+      }, true); // Mark this as the quote audio
 
-      // Calculate word timing based on actual audio duration
+      // Figure out how long each word should be highlighted based on actual audio length
       const wordDuration = quoteDuration / quoteWords.length;
 
-      // Animate through words synchronized with audio
+      // Schedule all the word replacements upfront using Web Audio API's precise timing
+      // This way the gain changes happen at exactly the right moment
+      if (quoteGainNodeRef.current && animalBuffer && replaceIndices.length > 0) {
+        const currentAudioTime = audioManager.getCurrentTime();
+        console.log("Scheduling word replacements. Quote starts at:", quoteStartTime, "Current time:", currentAudioTime);
+        console.log("Quote duration:", quoteDuration, "Word count:", quoteWords.length, "Word duration:", wordDuration);
+        
+        // Use exponential ramp for smoother volume transitions instead of instant changes
+        const rampTime = 0.05; // 50ms ramp time for smooth transitions
+        
+        replaceIndices.forEach((i) => {
+          const wordStartTime = quoteStartTime + i * wordDuration;
+          const wordEndTime = wordStartTime + wordDuration;
+          
+          // Make sure we're scheduling in the future
+          if (wordStartTime > currentAudioTime) {
+            console.log(`Replacing word ${i} "${quoteWords[i]}" at time ${wordStartTime} (word: "${quoteWords[i]}")`);
+            
+            // Duck the quote audio volume way down - use exponential ramp for smooth transition
+            quoteGainNodeRef.current!.gain.setValueAtTime(1.0, wordStartTime - rampTime);
+            quoteGainNodeRef.current!.gain.exponentialRampToValueAtTime(0.1, wordStartTime);
+            
+            // Play the animal sound at full volume - this replaces the word
+            playAudioBuffer(animalBuffer, {
+              startTime: wordStartTime,
+              duration: Math.min(wordDuration, animalBuffer.duration, 1.5), // Match word duration or cap at 1.5s
+              volume: 1.0,
+            });
+            
+            // Restore quote audio volume after the word - smooth ramp back up
+            quoteGainNodeRef.current!.gain.setValueAtTime(0.1, wordEndTime - rampTime);
+            quoteGainNodeRef.current!.gain.exponentialRampToValueAtTime(1.0, wordEndTime);
+          } else {
+            console.warn(`Word ${i} start time ${wordStartTime} is in the past! Skipping.`);
+          }
+        });
+      } else {
+        console.log("Word replacement not scheduled. Gain node:", !!quoteGainNodeRef.current, "Animal buffer:", !!animalBuffer, "Indices:", replaceIndices.length);
+      }
+
+      // Sync the word highlighting with the audio playback
       for (let i = 0; i < quoteWords.length; i++) {
         const wordStartTime = quoteStartTime + i * wordDuration;
         const currentTime = audioManager.getCurrentTime();
@@ -235,16 +316,9 @@ export const MashupPlayer = ({
         setCurrentWordIndex(i);
         
         if (replaceIndices.includes(i) && animalBuffer) {
-          // Show explosion and play animal sound overlay
+          // This word gets replaced with an animal sound - show the explosion effect
           setExplosionWord(quoteWords[i]);
           setShowExplosion(true);
-          
-          // Play animal sound overlay at the same time as the word
-          playAudioBuffer(animalBuffer, {
-            startTime: wordStartTime,
-            duration: Math.min(1.5, animalBuffer.duration), // Max 1.5 seconds
-            volume: 0.9,
-          });
           
           await sleep(wordDuration * 1000 + 200);
           setShowExplosion(false);
@@ -253,27 +327,27 @@ export const MashupPlayer = ({
         }
       }
 
-      // Wait for quote to finish
+      // Wait for the quote audio to actually finish playing
       const quoteEndTime = quoteStartTime + quoteDuration;
       const waitTime = Math.max(0, (quoteEndTime - audioManager.getCurrentTime()) * 1000);
       await sleep(waitTime);
 
-      // 3. Final animal sound (600ms) after a short gap
+      // End with another animal sound for a nice finish
       if (animalBuffer) {
-        const finalStartTime = quoteEndTime + 0.2; // 200ms gap
+        const finalStartTime = quoteEndTime + 0.2; // Small gap before the outro
         playAudioBuffer(animalBuffer, {
           startTime: finalStartTime,
           duration: 0.6,
           volume: 0.8,
         });
 
-        // Wait for final sound to finish
+        // Wait for the outro sound to finish before we're done
         const finalEndTime = finalStartTime + 0.6;
         const finalWaitTime = Math.max(0, (finalEndTime - audioManager.getCurrentTime()) * 1000);
         await sleep(finalWaitTime);
       }
 
-      // Cleanup URLs
+      // Free up the blob URLs we created
       if (quoteAudioUrl) URL.revokeObjectURL(quoteAudioUrl);
       if (animalAudioUrl) URL.revokeObjectURL(animalAudioUrl);
 
@@ -290,7 +364,7 @@ export const MashupPlayer = ({
   };
 
   const stopPlayback = () => {
-    // Stop all Web Audio API sources
+    // Kill all audio sources immediately
     if (audioManagerRef.current) {
       audioManagerRef.current.stopAll();
     }

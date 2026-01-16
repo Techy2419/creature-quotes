@@ -47,7 +47,7 @@ export const useSpeechSynthesis = () => {
       });
     } catch (error) {
       console.warn("ElevenLabs TTS failed, falling back to browser speech", error);
-      // Fallback to browser speech synthesis
+      // If ElevenLabs fails, use the browser's built-in speech synth as backup
       return fallbackSpeak(text);
     }
   };
@@ -73,7 +73,7 @@ export const useSpeechSynthesis = () => {
   };
 
   const speakWord = useCallback((word: string, _animal: AnimalSound): Promise<void> => {
-    // Use ElevenLabs TTS with the specified voice
+    // Just call ElevenLabs TTS - the voice is already set in the function
     return speakWithElevenLabs(word);
   }, []);
 

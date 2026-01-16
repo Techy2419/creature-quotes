@@ -10,10 +10,10 @@ const Index = () => {
   const [customQuote, setCustomQuote] = useState("");
   const [isFetchingQuote, setIsFetchingQuote] = useState(false);
 
-  // Preload voices on mount
+  // Preload browser voices when component mounts
   useEffect(() => {
     window.speechSynthesis.getVoices();
-    // Some browsers need this event
+    // Chrome and some other browsers need this event to actually load voices
     window.speechSynthesis.onvoiceschanged = () => {
       window.speechSynthesis.getVoices();
     };
@@ -21,13 +21,13 @@ const Index = () => {
 
   const handleAnimalClick = (animal: AnimalSound) => {
     setSelectedAnimal(animal);
-    // No preview sound on click - will be generated on mashup
+    // Not playing a preview sound here - we'll generate it when they hit play
   };
 
   const fetchRandomQuote = useCallback(async () => {
     setIsFetchingQuote(true);
     try {
-      // Use local quotes as fallback since API might have CORS issues
+      // Just using local quotes for now - had CORS issues with external APIs
       const quote = getRandomQuote();
       setCustomQuote(quote.quote);
     } catch (error) {
@@ -50,7 +50,7 @@ const Index = () => {
     setSelectedAnimal(randomAnimal);
     setCustomQuote(randomQuote.quote);
     
-    // Auto-play after a short delay
+    // Automatically start playing after a tiny delay so it feels smooth
     setTimeout(() => {
       const playButton = document.querySelector('[data-play-button]') as HTMLButtonElement;
       if (playButton && !playButton.disabled) {
