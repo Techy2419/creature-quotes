@@ -8,12 +8,13 @@ interface CassetteTapeProps {
   currentWord?: string;
 }
 
+// Retro cassette tape component - looks pretty cool with the spinning reels
 export const CassetteTape = ({ isPlaying, animalIcon, quoteText, currentWord }: CassetteTapeProps) => {
   return (
     <div className="relative w-full max-w-md mx-auto">
-      {/* Main cassette body with realistic gradient */}
+      {/* Main cassette body with realistic gradient - tried to make it look like a real tape */}
       <div className="bg-gradient-to-b from-neutral-700 via-neutral-600 to-neutral-800 rounded-xl p-6 border-4 border-neutral-900 shadow-[4px_4px_0_hsl(var(--foreground))]">
-        {/* Top label area */}
+        {/* Top label area - where the quote text shows up */}
         <div className="bg-gradient-to-br from-amber-100 to-orange-100 rounded-lg p-4 mb-4 border-2 border-neutral-900">
           <div className="flex items-center justify-between mb-2">
             <span className="font-display text-lg text-neutral-900">REMIX TAPE</span>
@@ -35,9 +36,9 @@ export const CassetteTape = ({ isPlaying, animalIcon, quoteText, currentWord }: 
           </div>
         </div>
 
-        {/* Tape reels section */}
+        {/* Tape reels section - the spinning circles that make it look like it's playing */}
         <div className="flex justify-center gap-12 py-4 relative">
-          {/* Tape film between reels - animated */}
+          {/* Tape film between reels - animated stripes that move when playing */}
           <div className="absolute top-1/2 left-1/4 right-1/4 h-3 -translate-y-1/2 z-0 overflow-hidden rounded">
             <div className={cn(
               "w-full h-full bg-gradient-to-r from-neutral-900 via-neutral-700 to-neutral-900 bg-[length:20px_100%]",
@@ -64,7 +65,7 @@ export const CassetteTape = ({ isPlaying, animalIcon, quoteText, currentWord }: 
             </div>
           </div>
 
-          {/* Right reel */}
+          {/* Right reel - also spins when playing */}
           <div className="relative z-10">
             <div
               className={cn(

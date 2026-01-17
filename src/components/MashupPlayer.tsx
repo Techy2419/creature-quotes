@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from "react";
 import { cn } from "@/lib/utils";
-import { AnimalSound } from "@/data/animalSounds";
+import { AnimalSound, animalSounds, getRandomAnimal } from "@/data/animalSounds";
 import { CassetteTape } from "./CassetteTape";
 import { WordDisplay } from "./WordDisplay";
 import { ExplosionEffect } from "./ExplosionEffect";
@@ -11,6 +11,16 @@ interface MashupPlayerProps {
   selectedQuote: string;
   onRandomize: () => void;
   onChaosMode: () => void;
+  isChaosMode?: boolean; // Flag to indicate chaos mode is active
+  onChaosModeComplete?: () => void; // Callback when chaos mode playback finishes
+  onChaosSelections?: (selections: Array<{ index: number; animal: AnimalSound }>) => void; // Callback to pass chaos selections to parent
+}
+
+interface MashupParts {
+  before: string;
+  replacedWord: string;
+  after: string;
+  wordIndex: number;
 }
 
 export const MashupPlayer = ({
@@ -18,49 +28,193 @@ export const MashupPlayer = ({
   selectedQuote,
   onRandomize,
   onChaosMode,
+  isChaosMode = false,
+  onChaosModeComplete,
+  onChaosSelections,
 }: MashupPlayerProps) => {
   const [isPlaying, setIsPlaying] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
+  const [isGenerating, setIsGenerating] = useState(false);
   const [words, setWords] = useState<string[]>([]);
   const [currentWordIndex, setCurrentWordIndex] = useState(-1);
   const [replacedIndices, setReplacedIndices] = useState<number[]>([]);
   const [showExplosion, setShowExplosion] = useState(false);
   const [explosionWord, setExplosionWord] = useState("");
+  const [explosionAnimal, setExplosionAnimal] = useState<AnimalSound | null>(null);
+  const [chaosSelections, setChaosSelections] = useState<Array<{ index: number; animal: AnimalSound }>>([]);
+
   const audioManagerRef = useRef<WebAudioManager | null>(null);
-  const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
-  const quoteGainNodeRef = useRef<GainNode | null>(null);
+  const animalBufferCache = useRef<Map<string, AudioBuffer>>(new Map());
+  const ttsUrlsRef = useRef<string[]>([]);
 
-  const canPlay = selectedAnimal && selectedQuote.trim().length > 0;
+  // In chaos mode, selectedAnimal can be null initially (Gemini picks the animals)
+  // In normal mode, we need selectedAnimal to be set
+  const canPlay = selectedQuote.trim().length > 0 && (isChaosMode || selectedAnimal);
 
-  // Set up the Web Audio Manager when component mounts
   useEffect(() => {
     audioManagerRef.current = getAudioManager();
     audioManagerRef.current.init();
 
     return () => {
-      // Stop all audio when component unmounts - prevents memory leaks
-      if (audioManagerRef.current) {
-        audioManagerRef.current.stopAll();
-      }
+      stopPlayback(true);
     };
   }, []);
 
-  const getRandomIndices = (wordCount: number): number[] => {
-    if (wordCount <= 2) return [Math.floor(Math.random() * wordCount)];
-    const count = Math.min(Math.floor(Math.random() * 2) + 1, wordCount - 1);
-    const indices: number[] = [];
-    while (indices.length < count) {
-      const idx = Math.floor(Math.random() * wordCount);
-      if (!indices.includes(idx)) {
-        indices.push(idx);
+  /** --- GEMINI Word Selection --- */
+  // Calls our edge function to get Gemini to pick which word to replace
+  const getWordIndexToReplace = async (quote: string, animalName: string): Promise<number | null> => {
+    const startTime = Date.now();
+    
+    try {
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/gemini-word-select`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+            "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          },
+          body: JSON.stringify({ quote, animalName }),
+        }
+      );
+      
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        throw new Error("Gemini API failed");
       }
+
+      const data = await response.json();
+      const index = data.index;
+      
+      if (typeof index !== "number" || index < 0) {
+        throw new Error("Invalid index from Gemini");
+      }
+
+      return index;
+    } catch (error) {
+      // Fallback to middle word if Gemini fails - better than nothing
+      const wordsArr = quote.split(/\s+/);
+      const fallbackIndex = wordsArr.length ? Math.floor(wordsArr.length / 2) : null;
+      return fallbackIndex;
     }
-    return indices.sort((a, b) => a - b);
   };
 
-  const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+  /** --- Split Quote --- */
+  // Splits the quote into before/after parts based on which word we're replacing
+  const createMashupParts = (quote: string, wordIndex: number): MashupParts | null => {
+    const wordsArr = quote.split(/\s+/);
+    if (!wordsArr.length) return null;
+    if (wordIndex < 0 || wordIndex >= wordsArr.length) wordIndex = Math.floor(wordsArr.length / 2);
 
-  const generateTTS = async (text: string): Promise<string | null> => {
+    return {
+      before: wordsArr.slice(0, wordIndex).join(" "),
+      replacedWord: wordsArr[wordIndex],
+      after: wordsArr.slice(wordIndex + 1).join(" "),
+      wordIndex,
+    };
+  };
+
+  /** --- Get Multiple Word Indices + Animal Sounds for Chaos Mode (using Gemini) --- */
+  // Chaos mode: Gemini picks multiple words AND which animal sound to use for each
+  // Way cooler than normal mode where we just pick one word
+  const getChaosSelections = async (quote: string, quoteWords: string[]): Promise<Array<{ index: number; animal: AnimalSound }>> => {
+    if (quoteWords.length <= 2) {
+      // Too short for chaos mode, just use fallback
+      const fallbackAnimal = selectedAnimal || getRandomAnimal();
+      return [{ index: Math.floor(quoteWords.length / 2), animal: fallbackAnimal }];
+    }
+    
+    try {
+      // Get list of available animal names to send to Gemini
+      const availableAnimals = animalSounds.map(a => a.name);
+      
+      const response = await fetch(
+        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/gemini-chaos-select`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
+            "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
+          },
+          body: JSON.stringify({
+            quote,
+            availableAnimals,
+          }),
+        }
+      );
+      
+      if (!response.ok) {
+        throw new Error("Gemini Chaos API failed");
+      }
+
+      const data = await response.json();
+      const selections = data.selections || [];
+      
+      if (!Array.isArray(selections) || selections.length < 2) {
+        throw new Error("Invalid selections from Gemini");
+      }
+
+      // Map animal names from Gemini response to actual AnimalSound objects
+      const mappedSelections: Array<{ index: number; animal: AnimalSound }> = [];
+      for (const sel of selections) {
+        const animal = animalSounds.find(a => a.name === sel.animal);
+        if (animal && sel.index >= 0 && sel.index < quoteWords.length) {
+          mappedSelections.push({ index: sel.index, animal });
+        }
+      }
+
+      if (mappedSelections.length < 2) {
+        throw new Error("Not enough valid selections");
+      }
+
+      // Sort by index so we process them in order
+      mappedSelections.sort((a, b) => a.index - b.index);
+
+      return mappedSelections;
+    } catch (error) {
+      // Fallback: use random selection if Gemini fails
+      const numReplacements = Math.min(
+        Math.floor(Math.random() * 3) + 2,
+        Math.floor(quoteWords.length / 2)
+      );
+      
+      const fallbackAnimal = selectedAnimal || getRandomAnimal();
+      // Blacklist common words that aren't fun to replace (articles, prepositions, etc)
+      const blacklist = new Set(["the", "a", "an", "and", "or", "but", "to", "of", "in", "on", "with", "for", "from"]);
+      const candidates = quoteWords
+        .map((w, i) => ({
+          word: w.replace(/[^\w]/g, "").toLowerCase(),
+          index: i,
+        }))
+        .filter(({ word }) => word.length > 2 && !blacklist.has(word))
+        .map(({ index }) => index);
+      
+      // Use candidates if we have enough, otherwise just use all words
+      const pool = candidates.length >= numReplacements ? candidates : quoteWords.map((_, i) => i);
+      const fallbackSelections: Array<{ index: number; animal: AnimalSound }> = [];
+      const usedIndices = new Set<number>();
+      
+      // Randomly pick words until we have enough
+      while (fallbackSelections.length < numReplacements && pool.length > 0) {
+        const randomIdx = Math.floor(Math.random() * pool.length);
+        const wordIndex = pool.splice(randomIdx, 1)[0];
+        if (!usedIndices.has(wordIndex)) {
+          // Use same animal for all fallback selections (simpler than picking different ones)
+          fallbackSelections.push({ index: wordIndex, animal: fallbackAnimal });
+          usedIndices.add(wordIndex);
+        }
+      }
+      
+      fallbackSelections.sort((a, b) => a.index - b.index);
+      return fallbackSelections;
+    }
+  };
+
+  /** --- ElevenLabs TTS --- */
+  // Generates text-to-speech audio using ElevenLabs API via our edge function
+  const generateTTS = async (text: string, animal: AnimalSound): Promise<string | null> => {
+    if (!text.trim()) return null;
     try {
       const response = await fetch(
         `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/elevenlabs-tts`,
@@ -71,311 +225,418 @@ export const MashupPlayer = ({
             "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
             "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
           },
-          body: JSON.stringify({ 
-            text,
-            voiceId: "ssKAEhdevSPzKs37U6qX" 
+          body: JSON.stringify({
+            text: text.trim(),
+            voiceId: "ssKAEhdevSPzKs37U6qX",
+            modelId: "eleven_turbo_v2_5",
+            voiceSettings: {
+              stability: animal.voiceSettings.stability,
+              similarity_boost: animal.voiceSettings.similarity_boost,
+              style: 0.5,
+              use_speaker_boost: true,
+            },
           }),
         }
       );
 
       if (!response.ok) throw new Error("TTS generation failed");
       const audioBlob = await response.blob();
-      return URL.createObjectURL(audioBlob);
+      const audioUrl = URL.createObjectURL(audioBlob);
+      ttsUrlsRef.current.push(audioUrl); // Track for cleanup later
+      return audioUrl;
     } catch (error) {
-      console.error("TTS generation failed:", error);
       return null;
     }
   };
 
-  const generateAnimalSound = async (sfxPrompt: string): Promise<string | null> => {
-    try {
-      const response = await fetch(
-        `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/elevenlabs-sfx`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "apikey": import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY,
-            "Authorization": `Bearer ${import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY}`,
-          },
-          body: JSON.stringify({ prompt: sfxPrompt, duration: 2 }),
-        }
-      );
-
-      if (!response.ok) throw new Error("SFX generation failed");
-      const audioBlob = await response.blob();
-      return URL.createObjectURL(audioBlob);
-    } catch (error) {
-      console.error("SFX generation failed:", error);
-      return null;
-    }
-  };
-
-  /**
-   * Convert the audio URL into an AudioBuffer that Web Audio API can work with
-   */
+  /** --- Load AudioBuffer --- */
+  // Loads audio from URL and converts it to AudioBuffer for Web Audio API
   const loadAudioBuffer = async (url: string): Promise<AudioBuffer | null> => {
     if (!audioManagerRef.current) return null;
     try {
       return await audioManagerRef.current.loadAudio(url);
     } catch (error) {
-      console.error("Failed to load audio buffer:", error);
       return null;
     }
   };
 
-  /**
-   * Play an AudioBuffer with Web Audio API - gives us precise timing control
-   */
-  const playAudioBuffer = (
+  /** --- Play Buffer with Web Audio API --- */
+  // Plays an AudioBuffer and waits for it to finish
+  const playAudioBuffer = async (
     buffer: AudioBuffer,
-    options: {
-      startTime?: number;
-      offset?: number;
-      duration?: number;
-      volume?: number;
-      onEnded?: () => void;
-    } = {},
-    isQuote: boolean = false
-  ): AudioBufferSourceNode | null => {
-    if (!audioManagerRef.current) return null;
-    const { source, gainNode } = audioManagerRef.current.playBuffer(buffer, options);
-    activeSourcesRef.current.push(source);
-    
-    // Store the quote's gain node so we can duck it during word replacements
-    if (isQuote) {
-      quoteGainNodeRef.current = gainNode;
-    }
-    
-    return source;
+    { startTime, offset, duration, volume }: { startTime?: number; offset?: number; duration?: number; volume?: number } = {}
+  ): Promise<void> => {
+    if (!audioManagerRef.current) return;
+    const audioManager = audioManagerRef.current;
+    const now = audioManager.getCurrentTime();
+    const sTime = startTime ?? now;
+    const dur = duration ?? buffer.duration;
+
+    const { source } = audioManager.playBuffer(buffer, { startTime: sTime, offset: offset ?? 0, duration: dur, volume: volume ?? 1.0 });
+    await new Promise(resolve => setTimeout(resolve, dur * 1000));
   };
 
-  const playMashup = async () => {
-    if (!canPlay || !selectedAnimal || !audioManagerRef.current) return;
+  /** --- Play Buffer with Word Highlighting (synchronized) --- */
+  // Plays audio AND highlights words at the same time - keeps them in sync
+  const playAudioBufferWithHighlighting = async (
+    buffer: AudioBuffer,
+    wordStart: number,
+    wordEnd: number,
+    { startTime, offset, duration, volume }: { startTime?: number; offset?: number; duration?: number; volume?: number } = {}
+  ): Promise<void> => {
+    if (!audioManagerRef.current) return;
+    const audioManager = audioManagerRef.current;
+    const now = audioManager.getCurrentTime();
+    const sTime = startTime ?? now;
+    const dur = duration ?? buffer.duration;
 
-    // Make sure AudioContext is running - browsers suspend it until user interaction
-    await audioManagerRef.current.resume();
+    // Start playing audio immediately
+    audioManager.playBuffer(buffer, { startTime: sTime, offset: offset ?? 0, duration: dur, volume: volume ?? 1.0 });
 
-    setIsLoading(true);
-    setIsPlaying(true);
-    
-    // Clean the quote text - remove extra spaces and ensure it's a valid string
-    let cleanQuote = selectedQuote.trim().replace(/\s+/g, ' ');
-    
-    // Defensive check - make sure nothing weird got prepended to the quote
-    // Sometimes empty quotes or edge cases can cause issues
-    if (!cleanQuote || cleanQuote.length === 0) {
-      console.error("Empty quote detected!");
-      setIsPlaying(false);
-      setIsLoading(false);
-      return;
-    }
-    
-    // Log the exact quote being sent to TTS for debugging
-    console.log("Original quote:", selectedQuote);
-    console.log("Cleaned quote being sent to TTS:", cleanQuote);
-    console.log("Quote starts with:", cleanQuote[0]);
-    
-    const quoteWords = cleanQuote.split(/\s+/);
-    setWords(quoteWords);
-    const replaceIndices = getRandomIndices(quoteWords.length);
-    setReplacedIndices(replaceIndices);
-    setCurrentWordIndex(-1);
-    setShowExplosion(false);
-
-    console.log("Words to replace at indices:", replaceIndices);
-
-    let quoteBuffer: AudioBuffer | null = null;
-    let animalBuffer: AudioBuffer | null = null;
-    let quoteAudioUrl: string | null = null;
-    let animalAudioUrl: string | null = null;
-
-    try {
-      // Generate both TTS and SFX at the same time to speed things up
-      // Make sure we send the cleaned quote, not the original
-      const [quoteUrl, animalUrl] = await Promise.all([
-        generateTTS(cleanQuote),
-        generateAnimalSound(selectedAnimal.sfxPrompt)
-      ]);
-
-      quoteAudioUrl = quoteUrl;
-      animalAudioUrl = animalUrl;
-
-      if (!quoteAudioUrl) {
-        console.error("Failed to generate quote audio");
-        setIsPlaying(false);
-        setIsLoading(false);
-        return;
-      }
-
-      // Stop any currently playing audio before loading new buffers
-      // This prevents old audio from playing over new audio
-      if (audioManagerRef.current) {
-        audioManagerRef.current.stopAll();
-      }
-
-      // Convert the audio URLs into AudioBuffers so we can schedule them precisely
-      const [quoteBuf, animalBuf] = await Promise.all([
-        loadAudioBuffer(quoteAudioUrl),
-        animalAudioUrl ? loadAudioBuffer(animalAudioUrl) : Promise.resolve(null),
-      ]);
-
-      quoteBuffer = quoteBuf;
-      animalBuffer = animalBuf;
-
-      if (!quoteBuffer) {
-        console.error("Failed to load quote audio buffer");
-        setIsPlaying(false);
-        setIsLoading(false);
-        return;
-      }
-
-      // Log the audio buffer details for debugging
-      console.log("Quote audio buffer loaded:");
-      console.log("  Duration:", quoteBuffer.duration, "seconds");
-      console.log("  Sample rate:", quoteBuffer.sampleRate);
-      console.log("  Number of channels:", quoteBuffer.numberOfChannels);
-
-      setIsLoading(false);
-
-      const audioManager = audioManagerRef.current;
-      const startTime = audioManager.getCurrentTime();
-
-      // Start with a quick animal sound to set the mood
-      if (animalBuffer) {
-        playAudioBuffer(animalBuffer, {
-          startTime,
-          duration: 0.8,
-          volume: 0.8,
-        });
-      }
-
-      // Play the quote after the intro sound, with a small gap
-      const quoteStartTime = startTime + 0.8 + 0.3; // 800ms sound + 300ms gap
-      const quoteDuration = quoteBuffer.duration;
-
-      // Play the quote and store its gain node for volume control
-      playAudioBuffer(quoteBuffer, {
-        startTime: quoteStartTime,
-        volume: 1.0,
-        onEnded: () => {
-          // Done playing the quote
-        },
-      }, true); // Mark this as the quote audio
-
-      // Figure out how long each word should be highlighted based on actual audio length
-      const wordDuration = quoteDuration / quoteWords.length;
-
-      // Schedule all the word replacements upfront using Web Audio API's precise timing
-      // This way the gain changes happen at exactly the right moment
-      if (quoteGainNodeRef.current && animalBuffer && replaceIndices.length > 0) {
-        const currentAudioTime = audioManager.getCurrentTime();
-        console.log("Scheduling word replacements. Quote starts at:", quoteStartTime, "Current time:", currentAudioTime);
-        console.log("Quote duration:", quoteDuration, "Word count:", quoteWords.length, "Word duration:", wordDuration);
-        
-        // Use exponential ramp for smoother volume transitions instead of instant changes
-        const rampTime = 0.05; // 50ms ramp time for smooth transitions
-        
-        replaceIndices.forEach((i) => {
-          const wordStartTime = quoteStartTime + i * wordDuration;
-          const wordEndTime = wordStartTime + wordDuration;
-          
-          // Make sure we're scheduling in the future
-          if (wordStartTime > currentAudioTime) {
-            console.log(`Replacing word ${i} "${quoteWords[i]}" at time ${wordStartTime} (word: "${quoteWords[i]}")`);
-            
-            // Duck the quote audio volume way down - use exponential ramp for smooth transition
-            quoteGainNodeRef.current!.gain.setValueAtTime(1.0, wordStartTime - rampTime);
-            quoteGainNodeRef.current!.gain.exponentialRampToValueAtTime(0.1, wordStartTime);
-            
-            // Play the animal sound at full volume - this replaces the word
-            playAudioBuffer(animalBuffer, {
-              startTime: wordStartTime,
-              duration: Math.min(wordDuration, animalBuffer.duration, 1.5), // Match word duration or cap at 1.5s
-              volume: 1.0,
-            });
-            
-            // Restore quote audio volume after the word - smooth ramp back up
-            quoteGainNodeRef.current!.gain.setValueAtTime(0.1, wordEndTime - rampTime);
-            quoteGainNodeRef.current!.gain.exponentialRampToValueAtTime(1.0, wordEndTime);
-          } else {
-            console.warn(`Word ${i} start time ${wordStartTime} is in the past! Skipping.`);
-          }
-        });
-      } else {
-        console.log("Word replacement not scheduled. Gain node:", !!quoteGainNodeRef.current, "Animal buffer:", !!animalBuffer, "Indices:", replaceIndices.length);
-      }
-
-      // Sync the word highlighting with the audio playback
-      for (let i = 0; i < quoteWords.length; i++) {
-        const wordStartTime = quoteStartTime + i * wordDuration;
-        const currentTime = audioManager.getCurrentTime();
-        const delay = Math.max(0, (wordStartTime - currentTime) * 1000);
-
-        await sleep(delay);
+    // Highlight words simultaneously while audio plays - calculate timing per word
+    const wordCount = wordEnd - wordStart;
+    if (wordCount > 0) {
+      const perWordMs = (dur / wordCount) * 1000;
+      for (let i = wordStart; i < wordEnd; i++) {
         setCurrentWordIndex(i);
-        
-        if (replaceIndices.includes(i) && animalBuffer) {
-          // This word gets replaced with an animal sound - show the explosion effect
-          setExplosionWord(quoteWords[i]);
-          setShowExplosion(true);
-          
-          await sleep(wordDuration * 1000 + 200);
-          setShowExplosion(false);
-        } else {
-          await sleep(wordDuration * 1000);
-        }
+        await new Promise(resolve => setTimeout(resolve, perWordMs));
       }
+    } else {
+      // No words to highlight, just wait for audio to finish
+      await new Promise(resolve => setTimeout(resolve, dur * 1000));
+    }
+  };
 
-      // Wait for the quote audio to actually finish playing
-      const quoteEndTime = quoteStartTime + quoteDuration;
-      const waitTime = Math.max(0, (quoteEndTime - audioManager.getCurrentTime()) * 1000);
-      await sleep(waitTime);
+  /** --- Play Animal Sound (cached) --- */
+  // Plays animal sound files - caches them so we don't reload every time
+  const playAnimalSound = async (soundUrl: string, maxDuration?: number): Promise<void> => {
+    if (!audioManagerRef.current) return;
 
-      // End with another animal sound for a nice finish
-      if (animalBuffer) {
-        const finalStartTime = quoteEndTime + 0.2; // Small gap before the outro
-        playAudioBuffer(animalBuffer, {
-          startTime: finalStartTime,
-          duration: 0.6,
-          volume: 0.8,
-        });
+    // Check cache first - way faster than loading every time
+    let buffer = animalBufferCache.current.get(soundUrl);
+    if (!buffer) {
+      buffer = await loadAudioBuffer(soundUrl);
+      if (!buffer) return;
+      animalBufferCache.current.set(soundUrl, buffer);
+    }
 
-        // Wait for the outro sound to finish before we're done
-        const finalEndTime = finalStartTime + 0.6;
-        const finalWaitTime = Math.max(0, (finalEndTime - audioManager.getCurrentTime()) * 1000);
-        await sleep(finalWaitTime);
-      }
+    // Play full sound by default, or cap at maxDuration if provided (like duck sounds)
+    const duration = maxDuration ? Math.min(maxDuration, buffer.duration) : buffer.duration;
+    await playAudioBuffer(buffer, { duration, volume: 1 });
+  };
 
-      // Free up the blob URLs we created
-      if (quoteAudioUrl) URL.revokeObjectURL(quoteAudioUrl);
-      if (animalAudioUrl) URL.revokeObjectURL(animalAudioUrl);
+  /** --- Highlight words in sync with TTS --- */
+  // Highlights words one by one based on audio duration - keeps it synced
+  const highlightWords = async (start: number, end: number, bufferDuration: number) => {
+    const count = end - start;
+    if (count <= 0) return;
+    const perWordMs = (bufferDuration / count) * 1000;
+    for (let i = start; i < end; i++) {
+      setCurrentWordIndex(i);
+      await new Promise(r => setTimeout(r, perWordMs));
+    }
+  };
 
-    } catch (error) {
-      console.error("Playback error:", error);
-    } finally {
+  /** --- Stop Playback & Cleanup --- */
+  // Stops all audio and cleans up blob URLs to prevent memory leaks
+  const stopPlayback = (cleanupOnly = false) => {
+    if (audioManagerRef.current) audioManagerRef.current.stopAll();
+    // Revoke blob URLs so browser can free up memory
+    ttsUrlsRef.current.forEach(URL.revokeObjectURL);
+    ttsUrlsRef.current = [];
+
+    if (!cleanupOnly) {
       setIsPlaying(false);
-      setIsLoading(false);
+      setIsGenerating(false);
+      setShowExplosion(false);
       setCurrentWordIndex(-1);
-      await sleep(1500);
       setWords([]);
       setReplacedIndices([]);
     }
   };
 
-  const stopPlayback = () => {
-    // Kill all audio sources immediately
-    if (audioManagerRef.current) {
-      audioManagerRef.current.stopAll();
-    }
-    activeSourcesRef.current = [];
+  /** --- Chaos Mode Playback (Multiple Animal Sounds Interleaved) --- */
+  // This is where the magic happens - plays multiple animal sounds throughout the quote
+  // Each replacement gets its own animal sound (picked by Gemini)
+  const playChaosMashup = async (
+    quoteWords: string[], 
+    selections: Array<{ index: number; animal: AnimalSound }>
+  ) => {
+    if (!audioManagerRef.current || selections.length === 0) return;
     
+    const replacementIndices = selections.map(s => s.index);
+    setReplacedIndices(replacementIndices);
+    
+    // Build segments: text chunks BETWEEN replacements (not including replaced words)
+    // Structure: [segment before first replacement] -> [animal] -> [segment between replacements] -> [animal] -> ... -> [final segment]
+    const segments: Array<{ text: string; startWord: number; endWord: number; afterReplaceIndex?: number }> = [];
+    
+    // Add segment before first replacement (if any words before first replacement)
+    if (replacementIndices[0] > 0) {
+      const segmentText = quoteWords.slice(0, replacementIndices[0]).join(" ");
+      segments.push({
+        text: segmentText,
+        startWord: 0,
+        endWord: replacementIndices[0],
+      });
+    }
+    
+    // Add segments between consecutive replacements
+    for (let i = 0; i < replacementIndices.length - 1; i++) {
+      const currentReplace = replacementIndices[i];
+      const nextReplace = replacementIndices[i + 1];
+      const segmentStart = currentReplace + 1;
+      const segmentEnd = nextReplace;
+      
+      if (segmentEnd > segmentStart) {
+        const segmentText = quoteWords.slice(segmentStart, segmentEnd).join(" ");
+        segments.push({
+          text: segmentText,
+          startWord: segmentStart,
+          endWord: segmentEnd,
+          afterReplaceIndex: currentReplace,
+        });
+      }
+    }
+    
+    // Add final segment after last replacement
+    const lastReplaceIndex = replacementIndices[replacementIndices.length - 1];
+    if (lastReplaceIndex + 1 < quoteWords.length) {
+      const finalSegmentText = quoteWords.slice(lastReplaceIndex + 1).join(" ");
+      segments.push({
+        text: finalSegmentText,
+        startWord: lastReplaceIndex + 1,
+        endWord: quoteWords.length,
+        afterReplaceIndex: lastReplaceIndex,
+      });
+    }
+    
+    // Generate TTS for all segments in parallel (only non-empty segments)
+    // Doing this in parallel saves a lot of time
+    const segmentPromises = segments.map(async (seg, idx) => {
+      if (!seg.text.trim()) {
+        return null;
+      }
+      try {
+        // Use the first animal's voice for TTS (or selectedAnimal if available)
+        const ttsAnimal = selectedAnimal || selections[0]?.animal || getRandomAnimal();
+        const url = await generateTTS(seg.text, ttsAnimal);
+        return url;
+      } catch (error) {
+        return null;
+      }
+    });
+    const segmentUrls = await Promise.all(segmentPromises);
+    
+    setIsGenerating(false);
+    setIsPlaying(true);
+    
+    // Playback sequence: segment -> animal -> segment -> animal -> ... -> segment
+    let segmentIdx = 0;
+    
+    // Play initial segment (before first replacement) if exists
+    if (replacementIndices[0] > 0 && segmentIdx < segments.length) {
+      const segment = segments[segmentIdx];
+      const segmentUrl = segmentUrls[segmentIdx];
+      
+      if (segmentUrl && segment.text.trim()) {
+        try {
+          const buffer = await loadAudioBuffer(segmentUrl);
+          if (buffer) {
+            await playAudioBufferWithHighlighting(buffer, segment.startWord, segment.endWord);
+          }
+        } catch (error) {
+          // Silently fail - better than crashing
+        }
+        URL.revokeObjectURL(segmentUrl);
+      }
+      segmentIdx++;
+    }
+    
+    // Play each replacement with its following segment
+    for (let i = 0; i < selections.length; i++) {
+      const selection = selections[i];
+      const replaceIndex = selection.index;
+      const animal = selection.animal;
+      
+      // Get duration limit for this specific animal (duck sounds are shorter)
+      const duckMaxDuration = animal.id === 'duck' ? 0.5 : undefined;
+      
+      // Play animal sound at replacement point (using the specific animal for this replacement)
+      setCurrentWordIndex(replaceIndex);
+      setExplosionWord(quoteWords[replaceIndex]);
+      setExplosionAnimal(animal); // Set the correct animal for explosion effect
+      setShowExplosion(true);
+      await playAnimalSound(animal.soundUrl, duckMaxDuration);
+      setShowExplosion(false);
+      setExplosionAnimal(null);
+      setCurrentWordIndex(-1); // Clear highlight after explosion
+      
+      // Play segment after this replacement (could be between replacements or final segment)
+      // Check all remaining segments to find one that comes after this replacement
+      while (segmentIdx < segments.length) {
+        const segment = segments[segmentIdx];
+        const segmentUrl = segmentUrls[segmentIdx];
+        
+        // Check if this segment comes after the current replacement
+        // Segments have afterReplaceIndex set to the replacement they follow
+        if (segment.afterReplaceIndex === replaceIndex && segmentUrl && segment.text.trim()) {
+          try {
+            const buffer = await loadAudioBuffer(segmentUrl);
+            if (buffer) {
+              await playAudioBufferWithHighlighting(buffer, segment.startWord, segment.endWord);
+            }
+          } catch (error) {
+            // Silently fail
+          }
+          URL.revokeObjectURL(segmentUrl);
+          segmentIdx++;
+          break; // Found and played the segment, move to next replacement
+        } else if (segment.afterReplaceIndex !== undefined && segment.afterReplaceIndex < replaceIndex) {
+          // Skip segments that should have been played earlier (safety check)
+          segmentIdx++;
+        } else {
+          // This segment belongs to a future replacement, stop checking
+          break;
+        }
+      }
+    }
+    
+    // Safety: Play any remaining segments (shouldn't happen, but just in case)
+    while (segmentIdx < segments.length) {
+      const segment = segments[segmentIdx];
+      const segmentUrl = segmentUrls[segmentIdx];
+      
+      if (segmentUrl && segment.text.trim()) {
+        try {
+          const buffer = await loadAudioBuffer(segmentUrl);
+          if (buffer) {
+            await playAudioBufferWithHighlighting(buffer, segment.startWord, segment.endWord);
+          }
+        } catch (error) {
+          // Silently fail
+        }
+        URL.revokeObjectURL(segmentUrl);
+      }
+      segmentIdx++;
+    }
+    
+    // Reset state
     setIsPlaying(false);
-    setIsLoading(false);
-    setShowExplosion(false);
+    setIsGenerating(false);
     setCurrentWordIndex(-1);
+    setTimeout(() => {
+      setWords([]);
+      setReplacedIndices([]);
+    }, 1000);
+  };
+
+  /** --- Main Mashup Playback --- */
+  // Main function that handles both normal and chaos mode playback
+  const playMashup = async () => {
+    if (!canPlay || !audioManagerRef.current) return;
+    // In chaos mode, selectedAnimal can be null (Gemini will choose)
+    // In normal mode, we need selectedAnimal
+    if (!isChaosMode && !selectedAnimal) return;
+    await audioManagerRef.current.resume();
+
+    setIsGenerating(true);
     setWords([]);
+    setCurrentWordIndex(-1);
     setReplacedIndices([]);
+    setShowExplosion(false);
+
+    const cleanQuote = selectedQuote.trim().replace(/\s+/g, " ");
+    const quoteWords = cleanQuote.split(/\s+/);
+    setWords(quoteWords);
+
+    try {
+      // CHAOS MODE: Multiple random replacements throughout quote (with Gemini-selected animals)
+      if (isChaosMode) {
+        const chaosSelections = await getChaosSelections(cleanQuote, quoteWords);
+        
+        // Store selections for UI display and notify parent
+        setChaosSelections(chaosSelections);
+        if (onChaosSelections) {
+          onChaosSelections(chaosSelections);
+        }
+        
+        await playChaosMashup(quoteWords, chaosSelections);
+        // Reset chaos mode after completion
+        if (onChaosModeComplete) {
+          setTimeout(() => onChaosModeComplete(), 500);
+        }
+        return;
+      }
+
+      // NORMAL MODE: Single word replacement
+      const wordIndex = await getWordIndexToReplace(cleanQuote, selectedAnimal.name);
+      if (wordIndex === null) throw new Error("No word index selected");
+
+      const parts = createMashupParts(cleanQuote, wordIndex);
+      if (!parts) throw new Error("Failed to split quote");
+
+      setReplacedIndices([parts.wordIndex]);
+
+      // Generate TTS in parallel
+      const [beforeUrl, afterUrl] = await Promise.all([
+        parts.before ? generateTTS(parts.before, selectedAnimal) : Promise.resolve(null),
+        parts.after ? generateTTS(parts.after, selectedAnimal) : Promise.resolve(null),
+      ]);
+
+      setIsGenerating(false);
+      setIsPlaying(true);
+
+      // Sequence playback - play animal sound first
+      const duckMaxDuration = selectedAnimal.id === 'duck' ? 0.5: undefined;
+      await playAnimalSound(selectedAnimal.soundUrl, duckMaxDuration);
+
+      if (beforeUrl) {
+        const beforeBuffer = await loadAudioBuffer(beforeUrl);
+        if (beforeBuffer) {
+          // Play audio and highlight words simultaneously
+          await playAudioBufferWithHighlighting(beforeBuffer, 0, parts.wordIndex);
+        }
+      }
+
+      // Explosion + animal replacement - show the POW effect and play animal sound
+      setCurrentWordIndex(parts.wordIndex);
+      setExplosionWord(parts.replacedWord);
+      setExplosionAnimal(selectedAnimal);
+      setShowExplosion(true);
+      await playAnimalSound(selectedAnimal.soundUrl, duckMaxDuration);
+      setShowExplosion(false);
+      setExplosionAnimal(null);
+
+      if (afterUrl) {
+        const afterBuffer = await loadAudioBuffer(afterUrl);
+        if (afterBuffer) {
+          // Play audio and highlight words simultaneously
+          await playAudioBufferWithHighlighting(afterBuffer, parts.wordIndex + 1, quoteWords.length);
+        }
+      }
+
+      // End with animal sound
+      await playAnimalSound(selectedAnimal.soundUrl, duckMaxDuration);
+
+    } catch (error) {
+      // Reset chaos mode on error
+      if (isChaosMode && onChaosModeComplete) {
+        onChaosModeComplete();
+      }
+    } finally {
+      // Only reset state if NOT in chaos mode (chaos mode handles its own cleanup)
+      // This prevents double cleanup which would cause issues
+      if (!isChaosMode) {
+        setIsPlaying(false);
+        setIsGenerating(false);
+        setCurrentWordIndex(-1);
+        setTimeout(() => {
+          setWords([]);
+          setReplacedIndices([]);
+        }, 1000);
+      }
+    }
   };
 
   return (
@@ -387,7 +648,6 @@ export const MashupPlayer = ({
         currentWord={words[currentWordIndex]}
       />
 
-      {/* Word display area */}
       {words.length > 0 && (
         <WordDisplay
           words={words}
@@ -397,22 +657,42 @@ export const MashupPlayer = ({
         />
       )}
 
-      {/* Explosion effect */}
-      {showExplosion && selectedAnimal && (
+      {showExplosion && explosionAnimal && (
         <ExplosionEffect
           word={explosionWord}
-          animalIcon={selectedAnimal.icon}
+          animalIcon={explosionAnimal.icon}
           onComplete={() => {}}
         />
       )}
 
-      {/* Controls */}
+      {/* Show Gemini-selected animals in chaos mode */}
+      {isChaosMode && chaosSelections.length > 0 && words.length > 0 && (
+        <div className="p-4 bg-muted rounded-lg border-2 border-dashed border-primary/30">
+          <p className="text-sm font-mono text-muted-foreground mb-2">
+            🌪️ <strong>Chaos Mode:</strong> Gemini selected these animals:
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {chaosSelections.map((sel, idx) => (
+              <div
+                key={idx}
+                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-background border border-primary/20"
+                title={`Word ${sel.index + 1}: "${words[sel.index] || '...'}" → ${sel.animal.name}`}
+              >
+                <img src={sel.animal.icon} alt={sel.animal.name} className="w-6 h-6" />
+                <span className="text-xs font-mono text-foreground">
+                  {sel.animal.name}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
       <div className="flex flex-col gap-4">
-        {/* Main play button */}
         <button
-          onClick={isPlaying ? stopPlayback : playMashup}
-          disabled={(!canPlay && !isPlaying) || isLoading}
           data-play-button
+          onClick={isPlaying ? () => stopPlayback(false) : playMashup}
+          disabled={(!canPlay && !isPlaying) || isGenerating}
           className={cn(
             "w-full py-4 px-6 rounded-xl font-display text-xl transition-all",
             "border-4 border-foreground shadow-[4px_4px_0_hsl(var(--foreground))]",
@@ -424,7 +704,7 @@ export const MashupPlayer = ({
             "disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:rotate-0"
           )}
         >
-          {isLoading ? (
+          {isGenerating ? (
             <>
               <span className="text-2xl animate-spin">⏳</span>
               GENERATING...
@@ -442,11 +722,10 @@ export const MashupPlayer = ({
           )}
         </button>
 
-        {/* Secondary buttons */}
         <div className="flex gap-3">
           <button
             onClick={onRandomize}
-            disabled={isPlaying || isLoading}
+            disabled={isPlaying || isGenerating}
             className={cn(
               "flex-1 py-3 px-4 rounded-lg font-mono font-bold transition-all",
               "bg-secondary text-secondary-foreground",
@@ -462,7 +741,7 @@ export const MashupPlayer = ({
 
           <button
             onClick={onChaosMode}
-            disabled={isPlaying || isLoading}
+            disabled={isPlaying || isGenerating}
             className={cn(
               "flex-1 py-3 px-4 rounded-lg font-mono font-bold transition-all",
               "bg-accent text-accent-foreground",
@@ -478,7 +757,7 @@ export const MashupPlayer = ({
         </div>
       </div>
 
-      {!canPlay && !isPlaying && (
+      {!canPlay && !isPlaying && !isGenerating && (
         <p className="text-center font-mono text-sm text-muted-foreground animate-pulse">
           ↑ Select an animal and enter a quote to create your mashup! ↑
         </p>

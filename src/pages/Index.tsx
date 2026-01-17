@@ -9,29 +9,24 @@ const Index = () => {
   const [selectedAnimal, setSelectedAnimal] = useState<AnimalSound | null>(null);
   const [customQuote, setCustomQuote] = useState("");
   const [isFetchingQuote, setIsFetchingQuote] = useState(false);
-
-  // Preload browser voices when component mounts
-  useEffect(() => {
-    window.speechSynthesis.getVoices();
-    // Chrome and some other browsers need this event to actually load voices
-    window.speechSynthesis.onvoiceschanged = () => {
-      window.speechSynthesis.getVoices();
-    };
-  }, []);
+  const [isChaosMode, setIsChaosMode] = useState(false);
+  const [chaosSelections, setChaosSelections] = useState<Array<{ index: number; animal: AnimalSound }>>([]);
 
   const handleAnimalClick = (animal: AnimalSound) => {
     setSelectedAnimal(animal);
     // Not playing a preview sound here - we'll generate it when they hit play
+    // Saves API calls and makes the UI feel snappier
   };
 
   const fetchRandomQuote = useCallback(async () => {
     setIsFetchingQuote(true);
     try {
       // Just using local quotes for now - had CORS issues with external APIs
+      // Plus local quotes are faster and more reliable anyway
       const quote = getRandomQuote();
       setCustomQuote(quote.quote);
     } catch (error) {
-      console.error("Failed to fetch quote:", error);
+      // Fallback to random quote if something goes wrong
       const quote = getRandomQuote();
       setCustomQuote(quote.quote);
     } finally {
@@ -45,18 +40,53 @@ const Index = () => {
   }, []);
 
   const handleChaosMode = useCallback(() => {
-    const randomAnimal = getRandomAnimal();
+    // Don't auto-select animal - let Gemini choose! Just pick a random quote
     const randomQuote = getRandomQuote();
-    setSelectedAnimal(randomAnimal);
+    
+    // Enable chaos mode FIRST, then set quote (but NOT animal - Gemini will choose)
+    setIsChaosMode(true);
+    // Set a temporary animal so play button is enabled (will be overridden by Gemini's choices)
+    // This is just for UI - actual playback uses Gemini's selections
+    if (!selectedAnimal) {
+      setSelectedAnimal(getRandomAnimal()); // Temporary, just to enable play button
+    }
     setCustomQuote(randomQuote.quote);
     
-    // Automatically start playing after a tiny delay so it feels smooth
+    // Automatically start playing after a delay to ensure state is set
     setTimeout(() => {
       const playButton = document.querySelector('[data-play-button]') as HTMLButtonElement;
-      if (playButton && !playButton.disabled) {
-        playButton.click();
+      
+      if (playButton) {
+        if (playButton.disabled) {
+          // Try again after a bit more delay if disabled
+          setTimeout(() => {
+            const retryButton = document.querySelector('[data-play-button]') as HTMLButtonElement;
+            if (retryButton && !retryButton.disabled) {
+              retryButton.click();
+            }
+          }, 500);
+        } else {
+          playButton.click();
+        }
       }
-    }, 300);
+    }, 600); // Delay to ensure state is set
+  }, [selectedAnimal]);
+  
+  // Reset chaos mode when playback completes (called from MashupPlayer)
+  const handleChaosModeComplete = useCallback(() => {
+    setIsChaosMode(false);
+    setChaosSelections([]);
+  }, []);
+
+  // Callback to receive chaos selections from MashupPlayer
+  // Updates UI to show which animals Gemini picked
+  const handleChaosSelections = useCallback((selections: Array<{ index: number; animal: AnimalSound }>) => {
+    setChaosSelections(selections);
+    // Update selectedAnimal to first one for UI consistency (optional - just for visual feedback)
+    if (selections.length > 0) {
+      // Don't override if user manually selected one, but update if it was temporary
+      setSelectedAnimal(prev => prev || selections[0].animal);
+    }
   }, []);
 
   return (
@@ -124,6 +154,9 @@ const Index = () => {
                 selectedQuote={customQuote}
                 onRandomize={handleRandomize}
                 onChaosMode={handleChaosMode}
+                isChaosMode={isChaosMode}
+                onChaosModeComplete={handleChaosModeComplete}
+                onChaosSelections={handleChaosSelections}
               />
             </section>
 

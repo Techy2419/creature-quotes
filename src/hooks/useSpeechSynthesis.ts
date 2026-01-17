@@ -46,7 +46,6 @@ export const useSpeechSynthesis = () => {
         audio.play().catch(() => resolve());
       });
     } catch (error) {
-      console.warn("ElevenLabs TTS failed, falling back to browser speech", error);
       // If ElevenLabs fails, use the browser's built-in speech synth as backup
       return fallbackSpeak(text);
     }

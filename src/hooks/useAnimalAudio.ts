@@ -28,12 +28,11 @@ export const useAnimalAudio = () => {
       audio.onerror = () => {
         if (timeout) clearTimeout(timeout);
         // Resolve instead of reject so the app doesn't crash if audio fails
-        console.warn("Audio failed to load, continuing...");
         resolve();
       };
 
       audio.play().catch(() => {
-        console.warn("Audio play failed, continuing...");
+        // Silently fail - better than crashing
         resolve();
       });
     });

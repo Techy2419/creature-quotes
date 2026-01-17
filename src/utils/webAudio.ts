@@ -1,6 +1,6 @@
 /**
- * Web Audio API wrapper - way better than HTML5 Audio for mixing sounds
- * Lets us control timing precisely and overlap multiple audio sources
+ * Web Audio API wrapper - honestly way better than HTML5 Audio for mixing sounds
+ * Gives us precise timing control and lets us overlap multiple audio sources without issues
  */
 
 export class WebAudioManager {
@@ -10,7 +10,7 @@ export class WebAudioManager {
 
   /**
    * Sets up the AudioContext - browsers require user interaction first
-   * Learned this the hard way when nothing worked on page load lol
+   * Learned this the hard way when nothing worked on page load, classic browser security thing
    */
   init(): AudioContext {
     if (this.audioContext && this.audioContext.state !== 'closed') {
@@ -19,7 +19,7 @@ export class WebAudioManager {
 
     this.audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
     
-    // Master volume control - hook everything through this so we can adjust overall volume
+    // Master volume control - everything goes through this so we can adjust overall volume easily
     this.masterGain = this.audioContext.createGain();
     this.masterGain.connect(this.audioContext.destination);
     this.masterGain.gain.value = 1.0;
@@ -28,8 +28,8 @@ export class WebAudioManager {
   }
 
   /**
-   * Resume AudioContext if it got suspended - browsers do this automatically
-   * Need to call this after user clicks something
+   * Resume AudioContext if it got suspended - browsers suspend it automatically for performance
+   * Gotta call this after user interaction (like clicking play)
    */
   async resume(): Promise<void> {
     if (!this.audioContext) {
@@ -42,7 +42,7 @@ export class WebAudioManager {
 
   /**
    * Fetch audio from URL and decode it into an AudioBuffer
-   * This is what we actually work with in Web Audio API
+   * AudioBuffer is what we actually work with in Web Audio API - way more flexible than HTML5 Audio
    */
   async loadAudio(url: string): Promise<AudioBuffer> {
     if (!this.audioContext) {
@@ -52,35 +52,30 @@ export class WebAudioManager {
     try {
       const response = await fetch(url);
       
-      // Check if response is actually audio
+      // Quick check if response is actually audio (just in case)
       const contentType = response.headers.get('content-type');
       if (!contentType || !contentType.includes('audio')) {
-        console.warn('Response might not be audio. Content-Type:', contentType);
+        // Not a big deal, but good to know if something's wrong
       }
       
       const arrayBuffer = await response.arrayBuffer();
-      
-      // Log the raw data size for debugging
-      console.log('Audio data received:', arrayBuffer.byteLength, 'bytes');
-      
       const audioBuffer = await this.audioContext!.decodeAudioData(arrayBuffer);
       
-      // Validate the decoded buffer
+      // Validate the decoded buffer - make sure it's actually valid audio
       if (audioBuffer.duration === 0 || isNaN(audioBuffer.duration)) {
-        console.error('Decoded audio buffer has invalid duration:', audioBuffer.duration);
+        throw new Error('Invalid audio buffer duration');
       }
       
       return audioBuffer;
     } catch (error) {
-      console.error('Failed to load audio:', error);
       throw error;
     }
   }
 
   /**
    * Play an AudioBuffer with precise timing control
-   * Can schedule it to start at a specific time, which is super useful for syncing
-   * Returns both the source and gain node so we can control volume dynamically
+   * Can schedule it to start at a specific time - super useful for syncing multiple sounds
+   * Returns both the source and gain node so we can control volume on the fly
    */
   playBuffer(
     buffer: AudioBuffer,
@@ -112,20 +107,20 @@ export class WebAudioManager {
     gainNode.connect(this.masterGain!);
     gainNode.gain.value = volume;
 
-    // Figure out when this sound will end
+    // Calculate when this sound will end (useful for scheduling other sounds)
     const endTime = duration
       ? startTime + duration
       : startTime + buffer.duration - offset;
 
-    // Set up callback if provided
+    // Set up callback if provided (for cleanup or chaining)
     if (onEnded) {
       source.onended = onEnded;
     }
 
-    // Actually start playing - the timing here is sample-accurate which is sick
+    // Actually start playing - timing here is sample-accurate which is pretty cool
     source.start(startTime, offset, duration);
 
-    // Keep track of what's playing so we can stop everything if needed
+    // Track what's playing so we can stop everything if needed
     this.activeSources.push(source);
 
     // Clean up when the sound finishes playing
@@ -143,21 +138,21 @@ export class WebAudioManager {
   }
 
   /**
-   * Stop everything that's currently playing - useful for cleanup
+   * Stop everything that's currently playing - useful for cleanup or when user hits pause
    */
   stopAll(): void {
     this.activeSources.forEach((source) => {
       try {
         source.stop();
       } catch (e) {
-        // Already stopped, no big deal
+        // Already stopped, no big deal - happens sometimes
       }
     });
     this.activeSources = [];
   }
 
   /**
-   * Get the current time in the audio context - this is what we use for scheduling
+   * Get the current time in the audio context - this is what we use for scheduling sounds
    */
   getCurrentTime(): number {
     if (!this.audioContext) {
@@ -168,7 +163,7 @@ export class WebAudioManager {
 
   /**
    * Clean up everything and close the AudioContext
-   * Good practice to call this when we're done
+   * Good practice to call this when component unmounts or we're done with audio
    */
   dispose(): void {
     this.stopAll();
@@ -181,11 +176,12 @@ export class WebAudioManager {
 }
 
 // Singleton pattern - only one audio manager instance
+// Don't want multiple AudioContexts running around, that'd be messy
 let audioManager: WebAudioManager | null = null;
 
 /**
  * Get the audio manager instance, creating it if it doesn't exist yet
- * Using singleton so we don't create multiple AudioContexts
+ * Using singleton pattern so we don't accidentally create multiple AudioContexts
  */
 export function getAudioManager(): WebAudioManager {
   if (!audioManager) {
